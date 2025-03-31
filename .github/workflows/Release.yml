@@ -1,14 +1,20 @@
-name: Gitea Automated Release
+name: Gitea Automated Release Pipeline
 
 on:
   push:
-    branches:
-      - main
+    branches: [ "main" ]
+    tags: [ "v*.*.*" ]  # 避免标签循环触发
   workflow_dispatch:
     inputs:
       version:
-        description: 'Release version (e.g., 1.20.0)'
+        description: "Release version (e.g., 1.20.0)"
         required: true
+
+# 全局权限设置（必需）
+permissions:
+  contents: write  # 允许创建标签和发布
+  packages: write  # 如需上传到GitHub Packages
+  actions: read    # 允许检查其他工作流状态
 
 jobs:
   prepare-release:
@@ -16,134 +22,162 @@ jobs:
     outputs:
       release_version: ${{ steps.set-version.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Get next version
-        id: set-version
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          echo "version=${{ github.event.inputs.version }}" >> $GITHUB_OUTPUT
-      
-      - name: Calculate next version
-        id: set-version-auto
-        if: github.event_name != 'workflow_dispatch'
-        run: |
-          # Get latest tag
-          git fetch --tags
-          LATEST_TAG=$(git describe --tags --abbrev=0 || echo "v0.0.0")
-          NEXT_VERSION=$(echo $LATEST_TAG | awk -F. '{printf "v%d.%d.%d", $1, $2, $3+1}')
-          echo "version=$NEXT_VERSION" >> $GITHUB_OUTPUT
-      
-      - name: Create version tag
-        id: create-tag
-        uses: mathieudutour/github-tag-action@v6.0
+      - name: Checkout Code
+        uses: actions/checkout@v4
         with:
-          custom_tag: ${{ steps.set-version.outputs.version }}
-          tag_prefix: 'v'
+          fetch-depth: 0  # 获取完整提交历史
+
+      - name: Set Release Version (Manual)
+        if: github.event_name == 'workflow_dispatch'
+        id: set-version-manual
+        run: |
+          version="${{ github.event.inputs.version }}"
+          # 验证版本格式
+          if [[ ! $version =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version format. Use semantic versioning (e.g., 1.20.0)"
+            exit 1
+          fi
+          # 确保有v前缀
+          version=${version#v}
+          echo "version=v${version}" >> $GITHUB_OUTPUT
+
+      - name: Calculate Next Version (Auto)
+        if: github.event_name != 'workflow_dispatch'
+        id: set-version-auto
+        run: |
+          git fetch --tags
+          LATEST_TAG=$(git describe --tags --abbrev=0 --match "v*.*.*" 2>/dev/null || echo "v0.0.0")
+          NEXT_PATCH=$(echo "$LATEST_TAG" | awk -F. '{printf "%d", $3+1}')
+          NEXT_VERSION="v$(echo "$LATEST_TAG" | awk -F. '{printf "%d.%d.%d", $1, $2, $3+1}')"
+          echo "version=$NEXT_VERSION" >> $GITHUB_OUTPUT
+          echo "::notice::Auto-generated version: $NEXT_VERSION"
+
+      - name: Create Git Tag
+        uses: actions/github-script@v6
+        with:
+          script: |
+            try {
+              const tag = '${{ steps.set-version-manual.outputs.version || steps.set-version-auto.outputs.version }}';
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/tags/${tag}`,
+                sha: context.sha
+              });
+              core.notice(`Tag ${tag} created successfully`);
+            } catch (error) {
+              core.setFailed(`Failed to create tag: ${error.message}`);
+            }
 
   build-packages:
     needs: prepare-release
     strategy:
       matrix:
-        platform: [linux-amd64, linux-arm64, darwin-amd64, darwin-arm64, windows-amd64]
-    runs-on: ubuntu-latest
+        platform: 
+          - { os: ubuntu-20.04, goos: linux, goarch: amd64, suffix: "" }
+          - { os: ubuntu-20.04, goos: linux, goarch: arm64, suffix: "" }
+          - { os: macos-11, goos: darwin, goarch: amd64, suffix: "" }
+          - { os: macos-11, goos: darwin, goarch: arm64, suffix: "" }
+          - { os: windows-2019, goos: windows, goarch: amd64, suffix: ".exe" }
+    runs-on: ${{ matrix.platform.os }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.prepare-release.outputs.release_version }}
 
-      - name: Set up build environment
+      - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: '^1.20'
-      
-      - uses: actions/setup-node@v4
+          go-version: "^1.20"
+          cache: true
+
+      - name: Set up Node.js (for frontend)
+        if: matrix.platform.goos != 'windows'
+        uses: actions/setup-node@v3
         with:
-          node-version: 'lts/*'
+          node-version: "lts/*"
+          cache: "yarn"
 
-      - name: Install dependencies
+      - name: Install Build Tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y make gcc zip tar gzip xz-utils
+          if [[ "${{ matrix.platform.goos }}" == "linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y make gcc
+          elif [[ "${{ matrix.platform.goos }}" == "darwin" ]]; then
+            brew install make
+          fi
 
-      - name: Build for ${{ matrix.platform }}
+      - name: Build Gitea
         env:
-          GOOS: ${{ contains(matrix.platform, 'linux') && 'linux' || contains(matrix.platform, 'darwin') && 'darwin' || 'windows' }}
-          GOARCH: ${{ contains(matrix.platform, 'arm64') && 'arm64' || 'amd64' }}
+          GOOS: ${{ matrix.platform.goos }}
+          GOARCH: ${{ matrix.platform.goarch }}
           TAGS: "bindata sqlite sqlite_unlock_notify"
+          CGO_ENABLED: 1
         run: |
           make clean
           make build
           mkdir -p release
-          BINARY_NAME="gitea-${{ env.GOOS }}-${{ env.GOARCH }}"
-          mv gitea $BINARY_NAME
-          if [ "${{ env.GOOS }}" = "windows" ]; then
-            mv $BINARY_NAME $BINARY_NAME.exe
-          fi
+          mv gitea release/gitea-${{ matrix.platform.goos }}-${{ matrix.platform.goarch }}${{ matrix.platform.suffix }}
 
-      - name: Package artifacts
+      - name: Package Artifacts
         run: |
-          VERSION=${{ needs.prepare-release.outputs.release_version }}
-          PLATFORM=${{ matrix.platform }}
-          BINARY_NAME="gitea-${{ contains(matrix.platform, 'linux') && 'linux' || contains(matrix.platform, 'darwin') && 'darwin' || 'windows' }}-${{ contains(matrix.platform, 'arm64') && 'arm64' || 'amd64' }}"
-          
-          mkdir -p dist
-          # Create Unix packages
-          if [[ "$PLATFORM" != *"windows"* ]]; then
-            tar -czvf dist/gitea-${VERSION}-${PLATFORM}.tar.gz ${BINARY_NAME}
+          cd release
+          if [[ "${{ matrix.platform.goos }}" == "windows" ]]; then
+            7z a ../gitea-${{ needs.prepare-release.outputs.release_version }}-${{ matrix.platform.goos }}-${{ matrix.platform.goarch }}.zip *
           else
-            zip -j dist/gitea-${VERSION}-${PLATFORM}.zip ${BINARY_NAME}.exe
+            tar -czvf ../gitea-${{ needs.prepare-release.outputs.release_version }}-${{ matrix.platform.goos }}-${{ matrix.platform.goarch }}.tar.gz *
           fi
+          cd ..
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
         with:
-          name: packages-${{ matrix.platform }}
-          path: dist/*
+          name: gitea-${{ matrix.platform.goos }}-${{ matrix.platform.goarch }}
+          path: |
+            gitea-*.tar.gz
+            gitea-*.zip
 
-  generate-release:
+  create-release:
     needs: [prepare-release, build-packages]
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v3
         with:
           path: artifacts
 
-      - name: Generate changelog
+      - name: Generate Changelog
         id: changelog
         run: |
-          git fetch --tags
+          git fetch --tags --force
           PREV_TAG=$(git describe --tags --abbrev=0 ${{ needs.prepare-release.outputs.release_version }}^ 2>/dev/null || echo "")
           if [ -z "$PREV_TAG" ]; then
-            CHANGES=$(git log --pretty=format:"- %s (%h)")
+            echo "changes=Initial release" >> $GITHUB_OUTPUT
           else
-            CHANGES=$(git log --pretty=format:"- %s (%h)" $PREV_TAG..${{ needs.prepare-release.outputs.release_version }})
+            changes=$(git log --pretty=format:"- %s (%h)" $PREV_TAG..${{ needs.prepare-release.outputs.release_version }})
+            echo "changes<<EOF" >> $GITHUB_OUTPUT
+            echo "$changes" >> $GITHUB_OUTPUT
+            echo "EOF" >> $GITHUB_OUTPUT
           fi
-          echo "changes<<EOF" >> $GITHUB_OUTPUT
-          echo "$CHANGES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Create GitHub release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
           tag_name: ${{ needs.prepare-release.outputs.release_version }}
-          name: Gitea ${{ needs.prepare-release.outputs.release_version }}
+          name: "Gitea ${{ needs.prepare-release.outputs.release_version }}"
           body: |
-            ## Gitea ${{ needs.prepare-release.outputs.release_version }}
-
-            ### Changelog
+            ## Changelog
             ${{ steps.changelog.outputs.changes }}
 
-            ### Downloads
-            - **Linux AMD64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-linux-amd64.tar.gz]()
-            - **Linux ARM64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-linux-arm64.tar.gz]()
-            - **macOS AMD64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-darwin-amd64.tar.gz]()
-            - **macOS ARM64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-darwin-arm64.tar.gz]()
-            - **Windows AMD64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-windows-amd64.zip]()
+            ## Downloads
+            - **Linux AMD64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-linux-amd64.tar.gz]
+            - **Linux ARM64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-linux-arm64.tar.gz]
+            - **macOS AMD64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-darwin-amd64.tar.gz]
+            - **macOS ARM64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-darwin-arm64.tar.gz]
+            - **Windows AMD64**: [gitea-${{ needs.prepare-release.outputs.release_version }}-windows-amd64.zip]
           files: |
-            artifacts/packages-linux-amd64/*
-            artifacts/packages-linux-arm64/*
-            artifacts/packages-darwin-amd64/*
-            artifacts/packages-darwin-arm64/*
-            artifacts/packages-windows-amd64/*
+            artifacts/gitea-linux-amd64/*.tar.gz
+            artifacts/gitea-linux-arm64/*.tar.gz
+            artifacts/gitea-darwin-amd64/*.tar.gz
+            artifacts/gitea-darwin-arm64/*.tar.gz
+            artifacts/gitea-windows-amd64/*.zip
